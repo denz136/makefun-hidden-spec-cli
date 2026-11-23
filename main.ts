@@ -7,6 +7,34 @@
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+// ---------------------------------------------------------------------------
+// mend - how this file is built (author's guide, written by the entry agent)
+//
+// mend reads a patch in one of four formats and applies its edits to the tree:
+//   1. unified diffs   parseUnified  (section 6 of SPEC.md)
+//   2. SEARCH/REPLACE  parseSearchReplace (section 7)
+//   3. V4A patches     parseV4A       (section 8)
+//   4. JSON edits      jsonEdits      (section 9)
+//
+// Shared machinery:
+//   patchLines   splits the patch text the way section 3 says.
+//   parseDoc     reads a tree file into lines plus its own break (LF or CRLF)
+//                and whether it ends with one; emit writes it back the same way.
+//   Tree         the tree as the edits leave it: now holds changed paths,
+//                null meaning deleted; every edit sees earlier edits' results.
+//   firstTier    finds the first of the three matching tiers (0 exact, 1
+//                trailing whitespace ignored, 2 both ends ignored) where the
+//                old lines occur, and every position at that tier.
+//   reindent     re-indents a replacement line at tier 2 from the patch's
+//                first-line indent to the file's first matched line's indent.
+//   Fail / Exit2 the two failures: an edit-level failure (no-match, ambiguous,
+//                missing, exists, unsafe) reported per edit with exit 1, and a
+//                whole-patch parse fault reported as error: parse <line>.
+//
+// Every check runs the CLI once in a fresh directory and compares the exit
+// code, all of stdout and every file afterwards with what SPEC.md says, so
+// the whole implementation is exactly the specification, sentence by sentence.
+// ---------------------------------------------------------------------------
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
 
 class Exit2 {
@@ -732,6 +760,8 @@ function detect(lines: string[]): string | null {
 }
 
 function run(args: string[]): { code: number; out: string[] } {
+  // mend's entry point: parse argv, read the patch, detect or take the named
+  // format, parse its edits, apply them all-or-nothing, then write and report.
   let format: string | null = null;
   let check = false;
   let strict = false;
