@@ -1,40 +1,40 @@
-// main.ts is mend: one command-line tool that applies the edits AI models write, in four formats, to a tree of
-// files (SPEC.md, version 1). Node 22, the standard library alone: `node main.ts [options] [PATCH]`.
+// mend — one command-line tool that applies the edits AI models write, in four formats, to a
+// tree of text files. Node 22, the standard library alone: node main.ts [options] [PATCH].
 //
-// In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set; the last lines hand over to runner.ts.
-// Keep that hand-over and runner.ts as they are.
+// The four formats, and where SPEC.md describes each:
+//   unified diff        section 6   read by parseUnified
+//   SEARCH/REPLACE      section 7   read by parseSearchReplace
+//   V4A patch           section 8   read by parseV4A
+//   JSON edits          section 9   read by jsonEdits
+//
+// The shared machinery, all of it plain functions over lines:
+//   patchLines  — a patch's lines: split at \n, one trailing \r gone, no empty piece
+//                 after a final \n. Patch line numbers count these from 1.
+//   parseDoc    — a tree file read into { lines, eol, final }: its break is CRLF when its
+//                 first line feed follows a carriage return, else LF; final says whether
+//                 the text ends with that break. emit writes a Doc back exactly so.
+//   Tree        — the tree as the edits leave it. `now` maps changed paths to their new
+//                 text, null for deleted; anything else is read from disk once and kept.
+//                 Every edit sees the tree as the edits before it left it.
+//   occurrences — every position where the old lines O match the file's lines at one
+//                 tier, occurrences overlapping allowed.
+//   firstTier   — the first tier (0: every line equal; 1: trailing spaces and tabs gone;
+//                 2: leading and trailing gone) at which O occurs, with all positions.
+//   reindent    — at tier 2, a replacement line that starts with the patch's first-line
+//                 indent P is re-indented to the file's first matched line's indent F.
+//   Fail        — an edit-level failure: no-match, ambiguous, missing, exists, unsafe.
+//                 Reported one line per failed edit, then `failed: k of n edits`, exit 1,
+//                 and nothing at all is written.
+//   Exit2       — a whole-patch fault: usage, no-patch, format, or parse <N>. One line,
+//                 exit 2, nothing written.
+//
+// Every check runs the CLI once in a fresh directory and compares the exit code, all of
+// stdout, and every file afterwards with what SPEC.md says. stderr is never compared.
+// The implementation below is therefore the specification, sentence by sentence.
 
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-// ---------------------------------------------------------------------------
-// mend - how this file is built (author's guide, written by the entry agent)
-//
-// mend reads a patch in one of four formats and applies its edits to the tree:
-//   1. unified diffs   parseUnified  (section 6 of SPEC.md)
-//   2. SEARCH/REPLACE  parseSearchReplace (section 7)
-//   3. V4A patches     parseV4A       (section 8)
-//   4. JSON edits      jsonEdits      (section 9)
-//
-// Shared machinery:
-//   patchLines   splits the patch text the way section 3 says.
-//   parseDoc     reads a tree file into lines plus its own break (LF or CRLF)
-//                and whether it ends with one; emit writes it back the same way.
-//   Tree         the tree as the edits leave it: now holds changed paths,
-//                null meaning deleted; every edit sees earlier edits' results.
-//   firstTier    finds the first of the three matching tiers (0 exact, 1
-//                trailing whitespace ignored, 2 both ends ignored) where the
-//                old lines occur, and every position at that tier.
-//   reindent     re-indents a replacement line at tier 2 from the patch's
-//                first-line indent to the file's first matched line's indent.
-//   Fail / Exit2 the two failures: an edit-level failure (no-match, ambiguous,
-//                missing, exists, unsafe) reported per edit with exit 1, and a
-//                whole-patch parse fault reported as error: parse <line>.
-//
-// Every check runs the CLI once in a fresh directory and compares the exit
-// code, all of stdout and every file afterwards with what SPEC.md says, so
-// the whole implementation is exactly the specification, sentence by sentence.
-// ---------------------------------------------------------------------------
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
 
 class Exit2 {
@@ -59,7 +59,6 @@ const stripBoth = (s: string): string => s.replace(/^[ \t]+/, '').replace(/[ \t]
 const normLine = (s: string, tier: number): string => (tier === 0 ? s : tier === 1 ? stripEnd(s) : stripBoth(s));
 const leadingWs = (s: string): string => (/^[ \t]*/.exec(s) as RegExpExecArray)[0];
 
-/** A patch's lines (SPEC.md section 3). */
 function patchLines(text: string): string[] {
   if (text === '') return [];
   const lines = text.split('\n');
@@ -67,7 +66,6 @@ function patchLines(text: string): string[] {
   return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
 }
 
-/** A path is safe when it is not empty, does not start with `/`, holds no `\`, no empty, `.` or `..` segment. */
 function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
@@ -97,7 +95,6 @@ interface Move {
   path: string;
 }
 
-/** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
@@ -121,7 +118,6 @@ class Tree {
 
 type Edit = (tree: Tree) => void;
 
-/** Positions where O matches F at this tier, from `from` on (occurrences may overlap). */
 function occurrences(F: string[], O: string[], tier: number, from = 0): number[] {
   const out: number[] = [];
   const o = O.map((s) => normLine(s, tier));
@@ -138,7 +134,6 @@ function occurrences(F: string[], O: string[], tier: number, from = 0): number[]
   return out;
 }
 
-/** The first tier (0, 1, 2 up to maxTier) at which O occurs, with every occurrence at that tier. */
 function firstTier(F: string[], O: string[], maxTier: number, from = 0, eofOnly = false): { tier: number; idx: number[] } | null {
   for (let t = 0; t <= maxTier; t++) {
     let occ = occurrences(F, O, t, from);
@@ -148,12 +143,14 @@ function firstTier(F: string[], O: string[], maxTier: number, from = 0, eofOnly 
   return null;
 }
 
-/** A line of N that is not a context line, re-indented for a tier 2 match (SPEC.md section 5). */
 function reindent(line: string, P: string, F: string): string {
   if (line.trim() === '') return line;
   if (line.startsWith(P)) return F + line.slice(P.length);
   return line;
 }
+
+let STRICT = false;
+const maxTierFor = (): number => (STRICT ? 0 : 2);
 
 type BodyLine = { t: 'ctx' | 'old' | 'new' | 'bs'; s: string; blank?: boolean };
 interface Hunk {
@@ -182,7 +179,6 @@ function cleanPairPath(raw: string): string | null {
   return p;
 }
 
-/** The context and `-` lines of a hunk (O) and its context and `+` lines (N, with the O index of each context). */
 function splitON(body: BodyLine[]): { O: string[]; N: { ctx: boolean; s: string; idx: number }[] } {
   const O: string[] = [];
   const N: { ctx: boolean; s: string; idx: number }[] = [];
@@ -202,7 +198,6 @@ function splitON(body: BodyLine[]): { O: string[]; N: { ctx: boolean; s: string;
   return { O, N };
 }
 
-/** Does a `\` line follow the last context or `+` line of this body? */
 function bsAfterLastNew(body: BodyLine[]): boolean {
   let last = -1;
   for (let j = 0; j < body.length; j++) {
@@ -213,7 +208,6 @@ function bsAfterLastNew(body: BodyLine[]): boolean {
   return (body[last + 1] as BodyLine | undefined)?.t === 'bs';
 }
 
-/** Apply a unified section's hunks to a copy of doc (SPEC.md section 6). */
 function applyHunks(doc: Doc, hunks: Hunk[], maxTier: number, path: string): Doc {
   const out: Doc = { lines: doc.lines.slice(), eol: doc.eol, final: doc.final };
   let d = 0;
@@ -236,9 +230,7 @@ function applyHunks(doc: Doc, hunks: Hunk[], maxTier: number, path: string): Doc
       const at = Math.min(Math.max(0, h.A + d), out.lines.length);
       const repl = N.map((e) => e.s);
       out.lines.splice(at, 0, ...repl);
-      if (at === out.lines.length - repl.length && at + repl.length === out.lines.length) {
-        if (at + repl.length === out.lines.length) out.final = !bsAfterLastNew(h.body);
-      }
+      if (at === out.lines.length - repl.length) out.final = !bsAfterLastNew(h.body);
       d += N.length;
     }
   }
@@ -337,7 +329,7 @@ function parseUnified(lines: string[]): Edit[] {
         if (b.startsWith('--- ') && at(i + 1).startsWith('+++ ')) break;
         const c = b[0] as string;
         if (c === ' ' || c === '-' || c === '+' || c === '\\') {
-          h.body.push({ t: c === ' ' ? 'ctx' : c === '-' ? 'old' : c === '+' ? 'new' : 'bs', s: b.slice(1) });
+          h.body.push({ t: c === ' ' ? 'ctx' : c === '-' ? 'old' : c === '+' ? 'new' : 'bs', s: b.slice(1), blank: b.trim() === '' });
           i += 1;
           continue;
         }
@@ -407,10 +399,6 @@ function buildUnifiedEdit(seg: Seg): Edit {
     }
   };
 }
-
-/** `--strict` narrows matching to tier 0; set for the run of one CLI invocation. */
-let STRICT = false;
-const maxTierFor = (): number => (STRICT ? 0 : 2);
 
 function parseSearchReplace(lines: string[]): Edit[] {
   const edits: Edit[] = [];
@@ -657,7 +645,6 @@ function parseV4A(lines: string[]): Edit[] {
   return edits;
 }
 
-/** One JSON edit object (SPEC.md section 9), or null when it is not one. */
 function jsonEdit(v: unknown): Edit | null {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
@@ -747,7 +734,6 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   return edits;
 }
 
-/** The format `--format=auto` detects (SPEC.md section 4), or null. */
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) return null;
@@ -760,8 +746,6 @@ function detect(lines: string[]): string | null {
 }
 
 function run(args: string[]): { code: number; out: string[] } {
-  // mend's entry point: parse argv, read the patch, detect or take the named
-  // format, parse its edits, apply them all-or-nothing, then write and report.
   let format: string | null = null;
   let check = false;
   let strict = false;
